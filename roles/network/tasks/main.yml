@@ -1,0 +1,69 @@
+---
+# ============================================================================
+# Role: network  –  Configure static IP on RHEL 10 (NetworkManager / nmcli)
+# ============================================================================
+
+- name: Ensure NetworkManager is installed and running
+  ansible.builtin.dnf:
+    name: NetworkManager
+    state: present
+
+- name: Enable and start NetworkManager
+  ansible.builtin.systemd:
+    name: NetworkManager
+    enabled: true
+    state: started
+
+# ── Discover existing connection name for the interface ──────────────────────
+- name: Get current connection name for {{ network_interface }}
+  ansible.builtin.command:
+    cmd: >
+      nmcli -t -f NAME,DEVICE connection show --active
+  register: _nmcli_active
+  changed_when: false
+
+- name: Set fact for existing connection name
+  ansible.builtin.set_fact:
+    _existing_conn: >-
+      {{ _nmcli_active.stdout_lines
+         | map('split', ':')
+         | selectattr('1', 'equalto', network_interface)
+         | map('first')
+         | first
+         | default('') }}
+
+# ── Remove existing DHCP connection if present ───────────────────────────────
+- name: Delete previous connection on {{ network_interface }} (if different name)
+  ansible.builtin.command:
+    cmd: "nmcli connection delete '{{ _existing_conn }}'"
+  when:
+    - _existing_conn | length > 0
+    - _existing_conn != network_connection_name
+  changed_when: true
+
+# ── Create static IP connection ──────────────────────────────────────────────
+- name: Create static IP connection {{ network_connection_name }}
+  community.general.nmcli:
+    conn_name: "{{ network_connection_name }}"
+    ifname: "{{ network_interface }}"
+    type: ethernet
+    ip4: "{{ network_ip_address }}/{{ network_prefix }}"
+    gw4: "{{ network_gateway }}"
+    dns4: "{{ network_dns_servers }}"
+    dns4_search: "{{ network_dns_search }}"
+    method4: manual
+    autoconnect: true
+    state: present
+  notify: restart_networkmanager
+
+# ── Set hostname to match inventory name ─────────────────────────────────────
+- name: Set system hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Ensure hostname in /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^{{ network_ip_address }}\s+'
+    line: "{{ network_ip_address }}  {{ inventory_hostname }} {{ inventory_hostname.split('.')[0] }}"
+    state: present

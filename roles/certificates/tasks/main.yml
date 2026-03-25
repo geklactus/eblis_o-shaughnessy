@@ -1,0 +1,207 @@
+---
+# ============================================================================
+# Role: certificates  –  Auto-parse & deploy InCommon PEM certificates
+# ============================================================================
+# This role:
+#   1. Scans cert_source_dir on the controller for .pem / .crt / .key files
+#   2. Inspects each file to classify it (private key, server cert, CA/chain)
+#   3. Deploys them to the correct RHEL locations
+#   4. Builds a full-chain bundle for GitLab Runner
+#   5. Updates the system trust store
+# ============================================================================
+
+# ── Discover certificate files on the Ansible controller ─────────────────────
+- name: Find all PEM / CRT / KEY files in source directory
+  ansible.builtin.find:
+    paths: "{{ cert_source_dir }}"
+    patterns:
+      - "*.pem"
+      - "*.crt"
+      - "*.key"
+      - "*.cer"
+    recurse: false
+  delegate_to: localhost
+  become: false
+  register: _cert_files_found
+
+- name: Fail if no certificate files found
+  ansible.builtin.assert:
+    that:
+      - _cert_files_found.files | length > 0
+    fail_msg: "No .pem/.crt/.key/.cer files found in {{ cert_source_dir }}"
+
+# ── Read and classify each file ──────────────────────────────────────────────
+- name: Slurp certificate files from controller
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _cert_files_found.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  delegate_to: localhost
+  become: false
+  register: _cert_contents
+
+- name: Classify certificate files
+  ansible.builtin.set_fact:
+    _private_keys: >-
+      {{ _cert_contents.results
+         | selectattr('content', 'search', 'UFJJVKFURS' )
+         | map(attribute='item.path')
+         | list }}
+    _all_certs: >-
+      {{ _cert_contents.results
+         | selectattr('content', 'search', 'Q0VSVElGSUNBVEUt')
+         | map(attribute='item.path')
+         | list }}
+
+# NOTE: The base64 search strings above correspond to fragments of
+# "PRIVATE KEY" and "CERTIFICATE-" in base64, which lets us classify
+# without decoding. We do the real openssl inspection next.
+
+- name: Inspect each certificate with openssl (on controller)
+  ansible.builtin.command:
+    cmd: >
+      openssl x509 -in "{{ item }}" -noout -subject -issuer -ext basicConstraints
+  loop: "{{ _all_certs }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  delegate_to: localhost
+  become: false
+  register: _cert_inspection
+  changed_when: false
+
+- name: Classify server cert vs CA/intermediate certs
+  ansible.builtin.set_fact:
+    _server_cert: >-
+      {{ _cert_inspection.results
+         | rejectattr('stdout', 'search', 'CA:TRUE')
+         | map(attribute='item')
+         | first }}
+    _ca_chain_certs: >-
+      {{ _cert_inspection.results
+         | selectattr('stdout', 'search', 'CA:TRUE')
+         | map(attribute='item')
+         | list }}
+
+- name: Display detected certificate layout
+  ansible.builtin.debug:
+    msg: |
+      Certificate auto-detection results:
+        Private key:    {{ _private_keys | map('basename') | join(', ') }}
+        Server cert:    {{ _server_cert | basename }}
+        CA/chain certs: {{ _ca_chain_certs | map('basename') | join(', ') }}
+
+- name: Validate exactly one private key was found
+  ansible.builtin.assert:
+    that:
+      - _private_keys | length == 1
+    fail_msg: >
+      Expected exactly 1 private key in {{ cert_source_dir }},
+      found {{ _private_keys | length }}: {{ _private_keys | map('basename') | join(', ') }}
+
+# ── Ensure destination directories exist ─────────────────────────────────────
+- name: Create certificate destination directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+    setype: "{{ item.setype }}"
+  loop:
+    - { path: "{{ cert_dest_dir }}",              mode: "0755", setype: "cert_t" }
+    - { path: "{{ cert_key_dest_dir }}",          mode: "0700", setype: "cert_t" }
+    - { path: "{{ cert_ca_bundle_dir }}",         mode: "0755", setype: "cert_t" }
+    - { path: "{{ cert_gitlab_runner_ssl_dir }}", mode: "0755", setype: "cert_t" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# ── Deploy the private key ───────────────────────────────────────────────────
+- name: Deploy private key
+  ansible.builtin.copy:
+    src: "{{ _private_keys[0] }}"
+    dest: "{{ cert_key_dest_dir }}/server.key"
+    owner: root
+    group: root
+    mode: "0600"
+    setype: cert_t
+  notify: restart_gitlab_runner
+
+# ── Deploy the server certificate ────────────────────────────────────────────
+- name: Deploy server certificate
+  ansible.builtin.copy:
+    src: "{{ _server_cert }}"
+    dest: "{{ cert_dest_dir }}/server.crt"
+    owner: root
+    group: root
+    mode: "0644"
+    setype: cert_t
+  notify: restart_gitlab_runner
+
+# ── Deploy CA / intermediate chain certificates ──────────────────────────────
+- name: Deploy CA / intermediate certificates to trust anchors
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ cert_ca_bundle_dir }}/{{ item | basename }}"
+    owner: root
+    group: root
+    mode: "0644"
+    setype: cert_t
+  loop: "{{ _ca_chain_certs }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  notify: update_ca_trust
+
+# ── Build a full-chain PEM for GitLab Runner ─────────────────────────────────
+- name: Read server certificate content
+  ansible.builtin.slurp:
+    src: "{{ cert_dest_dir }}/server.crt"
+  register: _deployed_server_cert
+
+- name: Read CA/intermediate certificate contents
+  ansible.builtin.slurp:
+    src: "{{ cert_ca_bundle_dir }}/{{ item | basename }}"
+  loop: "{{ _ca_chain_certs }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  register: _deployed_ca_certs
+
+- name: Assemble full-chain bundle (server + intermediates)
+  ansible.builtin.copy:
+    content: |
+      {{ _deployed_server_cert.content | b64decode }}
+      {% for ca in _deployed_ca_certs.results %}
+      {{ ca.content | b64decode }}
+      {% endfor %}
+    dest: "{{ cert_dest_dir }}/server-fullchain.pem"
+    owner: root
+    group: root
+    mode: "0644"
+    setype: cert_t
+  notify: restart_gitlab_runner
+
+# ── Deploy certs into GitLab Runner's own SSL directory ──────────────────────
+# GitLab Runner expects certs named after the GitLab host in its certs/ dir.
+- name: Extract GitLab hostname from URL
+  ansible.builtin.set_fact:
+    _gitlab_hostname: "{{ gitlab_url | urlsplit('hostname') }}"
+
+- name: Deploy full-chain for GitLab Runner (named by GitLab host)
+  ansible.builtin.copy:
+    src: "{{ cert_dest_dir }}/server-fullchain.pem"
+    dest: "{{ cert_gitlab_runner_ssl_dir }}/{{ _gitlab_hostname }}.crt"
+    owner: root
+    group: root
+    mode: "0644"
+    remote_src: true
+  notify: restart_gitlab_runner
+
+- name: Deploy private key for GitLab Runner
+  ansible.builtin.copy:
+    src: "{{ cert_key_dest_dir }}/server.key"
+    dest: "{{ cert_gitlab_runner_ssl_dir }}/{{ _gitlab_hostname }}.key"
+    owner: root
+    group: root
+    mode: "0600"
+    remote_src: true
+  notify: restart_gitlab_runner

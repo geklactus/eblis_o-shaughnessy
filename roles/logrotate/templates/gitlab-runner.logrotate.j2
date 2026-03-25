@@ -1,0 +1,13 @@
+/var/log/gitlab-runner/*.log {
+    {{ logrotate_gitlab_runner_frequency }}
+    rotate {{ logrotate_gitlab_runner_rotate_count }}
+    maxsize {{ logrotate_gitlab_runner_max_size }}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    su root root
+}

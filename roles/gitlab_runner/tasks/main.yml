@@ -1,0 +1,116 @@
+---
+# ============================================================================
+# Role: gitlab_runner  –  Install, configure, and register GitLab Runner
+# ============================================================================
+
+# ── Add GitLab Runner repository ─────────────────────────────────────────────
+- name: Add GitLab Runner repository
+  ansible.builtin.yum_repository:
+    name: runner_gitlab-runner
+    description: GitLab Runner
+    baseurl: "https://packages.gitlab.com/runner/gitlab-runner/el/$releasever/$basearch"
+    gpgcheck: true
+    gpgkey: |
+      https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+      https://packages.gitlab.com/runner/gitlab-runner/gpgkey/runner-gitlab-runner-4C80FB51394521E9.pub.gpg
+    sslverify: true
+    sslcacert: /etc/pki/tls/certs/ca-bundle.crt
+    repo_gpgcheck: true
+    enabled: true
+    file: runner_gitlab-runner
+    metadata_expire: "300"
+
+# ── Install GitLab Runner ────────────────────────────────────────────────────
+- name: Install gitlab-runner package
+  ansible.builtin.dnf:
+    name: gitlab-runner
+    state: present
+
+# ── Add gitlab-runner user to docker group ───────────────────────────────────
+- name: Add gitlab-runner user to docker group
+  ansible.builtin.user:
+    name: gitlab-runner
+    groups: docker
+    append: true
+  notify: restart_gitlab_runner
+
+# ── Ensure configuration directory and permissions ───────────────────────────
+- name: Ensure /etc/gitlab-runner exists with proper permissions
+  ansible.builtin.file:
+    path: /etc/gitlab-runner
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# ── Deploy GitLab Runner configuration ───────────────────────────────────────
+- name: Deploy gitlab-runner config.toml
+  ansible.builtin.template:
+    src: config.toml.j2
+    dest: /etc/gitlab-runner/config.toml
+    owner: root
+    group: root
+    mode: "0600"
+  notify: restart_gitlab_runner
+
+# ── Check if runner is already registered ────────────────────────────────────
+- name: Check for existing runner registrations
+  ansible.builtin.command:
+    cmd: gitlab-runner list
+  register: _runner_list
+  changed_when: false
+  failed_when: false
+
+# ── Register the runner with GitLab ──────────────────────────────────────────
+- name: Register GitLab Runner
+  ansible.builtin.command:
+    cmd: >
+      gitlab-runner register
+      --non-interactive
+      --url "{{ gitlab_url }}"
+      --token "{{ gitlab_runner_token }}"
+      --name "{{ gitlab_runner_name }}"
+      --executor "{{ gitlab_runner_executor }}"
+      --docker-image "{{ gitlab_runner_docker_image }}"
+      --docker-privileged=false
+      --docker-volumes "/cache"
+      --docker-shm-size 0
+      --docker-network-mtu 0
+      --tls-ca-file "{{ cert_gitlab_runner_ssl_dir }}/{{ gitlab_url | urlsplit('hostname') }}.crt"
+      --tag-list "{{ gitlab_runner_tags }}"
+      --run-untagged=false
+      --locked=false
+  when: >
+    gitlab_runner_name not in (_runner_list.stderr | default(''))
+    and gitlab_runner_name not in (_runner_list.stdout | default(''))
+  register: _runner_register
+  changed_when: _runner_register.rc == 0
+  no_log: true
+
+- name: Display registration result
+  ansible.builtin.debug:
+    msg: >
+      Runner '{{ gitlab_runner_name }}' registration:
+      {{ 'newly registered' if _runner_register.changed | default(false) else 'already registered' }}
+
+# ── Enable and start the service ─────────────────────────────────────────────
+- name: Enable and start gitlab-runner service
+  ansible.builtin.systemd:
+    name: gitlab-runner
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ── Verify the runner can reach GitLab ───────────────────────────────────────
+- name: Verify connectivity to GitLab instance
+  ansible.builtin.command:
+    cmd: >
+      gitlab-runner verify
+      --name "{{ gitlab_runner_name }}"
+  register: _runner_verify
+  changed_when: false
+  failed_when: false
+
+- name: Display verification result
+  ansible.builtin.debug:
+    msg: "{{ _runner_verify.stdout | default('') }} {{ _runner_verify.stderr | default('') }}"

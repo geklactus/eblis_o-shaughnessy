@@ -1,0 +1,40 @@
+---
+# ============================================================================
+# Role: logrotate  –  Configure log rotation for GitLab Runner & Docker
+# ============================================================================
+
+- name: Ensure logrotate is installed
+  ansible.builtin.dnf:
+    name: logrotate
+    state: present
+
+# ── GitLab Runner log rotation ───────────────────────────────────────────────
+- name: Deploy GitLab Runner logrotate configuration
+  ansible.builtin.template:
+    src: gitlab-runner.logrotate.j2
+    dest: /etc/logrotate.d/gitlab-runner
+    owner: root
+    group: root
+    mode: "0644"
+
+# ── Docker container log rotation (belt-and-suspenders with daemon.json) ────
+- name: Deploy Docker logrotate configuration
+  ansible.builtin.template:
+    src: docker-containers.logrotate.j2
+    dest: /etc/logrotate.d/docker-containers
+    owner: root
+    group: root
+    mode: "0644"
+
+# ── Verify logrotate configs are valid ───────────────────────────────────────
+- name: Validate logrotate configuration
+  ansible.builtin.command:
+    cmd: logrotate --debug /etc/logrotate.d/gitlab-runner
+  register: _logrotate_check
+  changed_when: false
+  failed_when: false
+
+- name: Warn if logrotate config has issues
+  ansible.builtin.debug:
+    msg: "WARNING: logrotate config validation returned warnings - review /etc/logrotate.d/gitlab-runner"
+  when: _logrotate_check.rc != 0

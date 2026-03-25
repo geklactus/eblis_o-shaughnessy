@@ -1,0 +1,96 @@
+---
+# ============================================================================
+# Role: docker  –  Install and configure Docker CE on RHEL 10
+# ============================================================================
+
+# ── Prerequisites ────────────────────────────────────────────────────────────
+- name: Remove conflicting packages
+  ansible.builtin.dnf:
+    name:
+      - podman
+      - buildah
+      - containers-common
+    state: absent
+
+- name: Install required dependencies
+  ansible.builtin.dnf:
+    name:
+      - dnf-plugins-core
+      - device-mapper-persistent-data
+      - lvm2
+    state: present
+
+# ── Add Docker repository ────────────────────────────────────────────────────
+- name: Add Docker CE repository
+  ansible.builtin.yum_repository:
+    name: docker-ce-stable
+    description: Docker CE Stable - $basearch
+    baseurl: "https://download.docker.com/linux/rhel/$releasever/$basearch/stable"
+    gpgcheck: true
+    gpgkey: "https://download.docker.com/linux/rhel/gpg"
+    enabled: true
+    file: docker-ce
+
+# ── Install Docker CE ────────────────────────────────────────────────────────
+- name: Install Docker CE packages
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+
+# ── Configure Docker daemon ──────────────────────────────────────────────────
+- name: Ensure /etc/docker directory exists
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy Docker daemon configuration
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart_docker
+
+# ── Enable and start Docker ──────────────────────────────────────────────────
+- name: Enable and start Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Enable containerd service
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started
+
+# ── Add gitlab-runner user to docker group ───────────────────────────────────
+- name: Ensure docker group exists
+  ansible.builtin.group:
+    name: docker
+    state: present
+
+- name: Verify Docker is operational
+  ansible.builtin.command:
+    cmd: docker info
+  register: _docker_info
+  changed_when: false
+
+- name: Display Docker version
+  ansible.builtin.command:
+    cmd: docker version --format '{{ "{{" }}.Server.Version{{ "}}" }}'
+  register: _docker_version
+  changed_when: false
+
+- name: Show Docker version
+  ansible.builtin.debug:
+    msg: "Docker {{ _docker_version.stdout }} is running"

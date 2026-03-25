@@ -1,0 +1,75 @@
+---
+# ============================================================================
+# Role: selinux  –  Configure SELinux for GitLab Runner + Docker
+# ============================================================================
+
+- name: Install SELinux management packages
+  ansible.builtin.dnf:
+    name:
+      - policycoreutils
+      - policycoreutils-python-utils
+      - selinux-policy-targeted
+      - container-selinux
+      - setools-console
+    state: present
+
+- name: Set SELinux mode to {{ selinux_mode }}
+  ansible.posix.selinux:
+    policy: "{{ selinux_policy }}"
+    state: "{{ selinux_mode }}"
+  register: _selinux_result
+
+- name: Reboot if SELinux state changed and requires it
+  ansible.builtin.reboot:
+    msg: "Rebooting to apply SELinux state change"
+    reboot_timeout: 300
+  when: _selinux_result.reboot_required | default(false)
+
+# ── SELinux booleans for Docker / container operation ────────────────────────
+- name: Enable SELinux booleans for container support
+  ansible.posix.seboolean:
+    name: "{{ item }}"
+    state: true
+    persistent: true
+  loop:
+    - container_manage_cgroup
+  # container_manage_cgroup lets systemd-managed containers work under SELinux
+
+# ── Allow GitLab Runner to connect to GitLab over HTTPS ──────────────────────
+- name: Allow GitLab Runner to make outbound HTTPS connections
+  ansible.posix.seboolean:
+    name: "{{ item }}"
+    state: true
+    persistent: true
+  loop:
+    - httpd_can_network_connect
+
+# ── Custom SELinux module for GitLab Runner if needed ────────────────────────
+- name: Deploy custom SELinux policy module for gitlab-runner
+  ansible.builtin.template:
+    src: gitlab_runner.te.j2
+    dest: /tmp/gitlab_runner.te
+    mode: "0644"
+  register: _selinux_module
+
+- name: Compile and install custom SELinux module
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd /tmp
+    checkmodule -M -m -o gitlab_runner.mod gitlab_runner.te
+    semodule_package -o gitlab_runner.pp -m gitlab_runner.mod
+    semodule -i gitlab_runner.pp
+  args:
+    executable: /bin/bash
+  when: _selinux_module.changed
+  changed_when: true
+
+- name: Verify SELinux status
+  ansible.builtin.command:
+    cmd: getenforce
+  register: _getenforce
+  changed_when: false
+
+- name: Display SELinux status
+  ansible.builtin.debug:
+    msg: "SELinux is currently: {{ _getenforce.stdout }}"

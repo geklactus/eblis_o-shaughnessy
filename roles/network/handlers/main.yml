@@ -1,0 +1,14 @@
+---
+- name: restart_networkmanager
+  ansible.builtin.systemd:
+    name: NetworkManager
+    state: restarted
+
+  # Allow the interface to come back up before continuing
+- name: wait_for_network
+  ansible.builtin.wait_for:
+    host: "{{ network_ip_address }}"
+    port: 22
+    delay: 5
+    timeout: 60
+  listen: restart_networkmanager

@@ -1,0 +1,71 @@
+---
+# ============================================================================
+# Role: firewall  –  Configure firewalld for GitLab Runner
+# ============================================================================
+
+- name: Install firewalld
+  ansible.builtin.dnf:
+    name: firewalld
+    state: present
+
+- name: Enable and start firewalld
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+# ── Set default zone ─────────────────────────────────────────────────────────
+- name: Set default firewalld zone to {{ firewall_zone }}
+  ansible.builtin.command:
+    cmd: "firewall-cmd --set-default-zone={{ firewall_zone }}"
+  register: _fw_zone
+  changed_when: "'ZONE_ALREADY_SET' not in _fw_zone.stderr"
+  failed_when:
+    - _fw_zone.rc != 0
+    - "'ZONE_ALREADY_SET' not in _fw_zone.stderr"
+
+# ── Open required ports ──────────────────────────────────────────────────────
+- name: Allow required ports through firewall
+  ansible.posix.firewalld:
+    port: "{{ item.port }}"
+    zone: "{{ firewall_zone }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ firewall_allowed_ports }}"
+  loop_control:
+    label: "{{ item.port }} ({{ item.comment }})"
+
+# ── Allow Docker interface ───────────────────────────────────────────────────
+- name: Add docker0 interface to trusted zone
+  ansible.posix.firewalld:
+    interface: docker0
+    zone: trusted
+    permanent: true
+    immediate: true
+    state: enabled
+
+# ── Enable masquerading for Docker NAT ───────────────────────────────────────
+- name: Enable masquerading in {{ firewall_zone }} zone
+  ansible.posix.firewalld:
+    masquerade: true
+    zone: "{{ firewall_zone }}"
+    permanent: true
+    immediate: true
+    state: enabled
+
+# ── Reload firewalld to apply all changes ────────────────────────────────────
+- name: Reload firewalld
+  ansible.builtin.command:
+    cmd: firewall-cmd --reload
+  changed_when: true
+
+- name: Display active firewall rules
+  ansible.builtin.command:
+    cmd: firewall-cmd --list-all
+  register: _fw_rules
+  changed_when: false
+
+- name: Show firewall configuration
+  ansible.builtin.debug:
+    var: _fw_rules.stdout_lines

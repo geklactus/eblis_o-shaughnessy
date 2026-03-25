@@ -1,0 +1,64 @@
+---
+# ============================================================================
+# GitLab Runner Deployment Playbook
+# Target: Red Hat 10 on ESX VM
+# Components: Docker executor, InCommon SSL, static IP, firewalld, SELinux
+# ============================================================================
+
+- name: Deploy GitLab Runner on RHEL 10 ESX VM
+  hosts: gitlab_runners
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate target is Red Hat family
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+        fail_msg: "This playbook targets Red Hat Enterprise Linux. Detected: {{ ansible_os_family }}"
+
+    - name: Validate required variables are defined
+      ansible.builtin.assert:
+        that:
+          - gitlab_url is defined
+          - gitlab_runner_token is defined
+          - network_ip_address is defined
+          - network_gateway is defined
+          - cert_source_dir is defined
+        fail_msg: >
+          Required variables are missing. Ensure gitlab_url, gitlab_runner_token,
+          network_ip_address, network_gateway, and cert_source_dir are set in
+          group_vars/all.yml or passed via --extra-vars.
+
+  roles:
+    - role: network
+      tags: [network, ip]
+    - role: certificates
+      tags: [certificates, ssl]
+    - role: selinux
+      tags: [selinux, security]
+    - role: firewall
+      tags: [firewall, security]
+    - role: docker
+      tags: [docker]
+    - role: gitlab_runner
+      tags: [gitlab_runner, runner]
+    - role: logrotate
+      tags: [logrotate, logging]
+
+  post_tasks:
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ====================================================
+            GitLab Runner Deployment Complete
+          ====================================================
+            Host:        {{ ansible_hostname }}
+            IP Address:  {{ network_ip_address }}
+            GitLab URL:  {{ gitlab_url }}
+            Runner Name: {{ gitlab_runner_name }}
+            Executor:    docker
+            SSL:         InCommon certificates installed
+            Firewall:    firewalld active
+            SELinux:     {{ selinux_mode }}
+          ====================================================

@@ -1,0 +1,21 @@
+module gitlab_runner 1.0;
+
+require {
+    type init_t;
+    type container_runtime_t;
+    type gitlab_runner_t;
+    type cert_t;
+    type http_port_t;
+    type dns_port_t;
+    class tcp_socket { name_connect };
+    class file { read getattr open };
+    class dir { search getattr };
+}
+
+# Allow gitlab-runner to read SSL certificates
+allow init_t cert_t:file { read getattr open };
+allow init_t cert_t:dir { search getattr };
+
+# Allow gitlab-runner to connect to HTTPS (443) and DNS (53)
+allow init_t http_port_t:tcp_socket name_connect;
+allow init_t dns_port_t:tcp_socket name_connect;
