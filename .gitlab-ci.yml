@@ -1,0 +1,147 @@
+---
+stages:
+  - lint
+  - syntax
+  - dry-run
+  - validate
+
+default:
+  image: python:3.12-slim
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  PY_COLORS: "1"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+
+# ── Stage 1: Lint ──────────────────────────────────────────────────────────
+yamllint:
+  stage: lint
+  before_script:
+    - pip install yamllint
+  script:
+    - yamllint -c .yamllint.yml .
+
+ansible-lint:
+  stage: lint
+  before_script:
+    - pip install ansible-lint ansible-core
+    - ansible-galaxy install -r requirements.yml
+  script:
+    - ansible-lint site.yml
+
+# ── Stage 2: Syntax Check ─────────────────────────────────────────────────
+syntax-check:
+  stage: syntax
+  needs: [yamllint, ansible-lint]
+  before_script:
+    - pip install ansible-core
+    - ansible-galaxy install -r requirements.yml
+  script:
+    - ansible-config dump --only-changed
+    - ansible-playbook site.yml --syntax-check
+
+# ── Stage 3: Dry-Run (Check Mode) ─────────────────────────────────────────
+dry-run:
+  stage: dry-run
+  needs: [syntax-check]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq openssl > /dev/null
+    - pip install ansible-core
+    - ansible-galaxy install -r requirements.yml
+  script:
+    - mkdir -p /tmp/test-certs
+    - >
+      openssl req -x509 -nodes -newkey rsa:2048
+      -keyout /tmp/test-certs/ca.key
+      -out /tmp/test-certs/ca.crt
+      -days 1 -subj "/CN=Test InCommon CA"
+      -addext "basicConstraints=critical,CA:TRUE"
+    - >
+      openssl req -nodes -newkey rsa:2048
+      -keyout /tmp/test-certs/server.key
+      -out /tmp/test-certs/server.csr
+      -subj "/CN=gitlab.example.com"
+    - >
+      openssl x509 -req
+      -in /tmp/test-certs/server.csr
+      -CA /tmp/test-certs/ca.crt
+      -CAkey /tmp/test-certs/ca.key
+      -CAcreateserial
+      -out /tmp/test-certs/server.crt
+      -days 1
+    - rm -f /tmp/test-certs/server.csr /tmp/test-certs/ca.key
+    - |
+      cat > inventory/ci-hosts.yml << 'EOF'
+      ---
+      all:
+        children:
+          gitlab_runners:
+            hosts:
+              localhost:
+                ansible_connection: local
+                ansible_python_interpreter: /usr/bin/python3
+      EOF
+    - |
+      cat > group_vars/ci.yml << 'EOF'
+      ---
+      gitlab_url: "https://gitlab.example.com"
+      gitlab_runner_token: "glrt-ci-test-token-not-real"
+      gitlab_runner_name: "ci-test-runner"
+      network_interface: "eth0"
+      network_ip_address: "10.0.0.100"
+      network_prefix: 24
+      network_gateway: "10.0.0.1"
+      network_dns_servers: ["8.8.8.8"]
+      network_dns_search: ["example.com"]
+      cert_source_dir: "/tmp/test-certs"
+      EOF
+    - >
+      ansible-playbook site.yml
+      -i inventory/ci-hosts.yml
+      -e @group_vars/ci.yml
+      --check --diff -vv
+  allow_failure: true
+
+# ── Stage 4: Validate Project Structure ────────────────────────────────────
+validate-structure:
+  stage: validate
+  image: alpine:latest
+  script:
+    - |
+      echo "Checking project structure..."
+      missing=0
+      for f in \
+        site.yml ansible.cfg requirements.yml \
+        inventory/hosts.yml group_vars/all.yml \
+        roles/network/tasks/main.yml \
+        roles/network/handlers/main.yml \
+        roles/certificates/tasks/main.yml \
+        roles/certificates/handlers/main.yml \
+        roles/selinux/tasks/main.yml \
+        roles/selinux/templates/gitlab_runner.te.j2 \
+        roles/firewall/tasks/main.yml \
+        roles/gitlab_runner/tasks/main.yml \
+        roles/gitlab_runner/handlers/main.yml \
+        roles/gitlab_runner/templates/config.toml.j2 \
+        roles/logrotate/tasks/main.yml \
+        roles/logrotate/templates/gitlab-runner.logrotate.j2
+      do
+        if [ ! -f "$f" ]; then
+          echo "  MISSING: $f"; missing=$((missing + 1))
+        else
+          echo "  OK: $f"
+        fi
+      done
+      [ $missing -gt 0 ] && echo "ERROR: $missing file(s) missing" && exit 1
+      echo "All required files present."
+    - |
+      echo "Checking for leaked secrets..."
+      violations=0
+      grep -rn 'glrt-[a-zA-Z0-9]\{20,\}' group_vars/all.yml 2>/dev/null && violations=$((violations + 1))
+      find . -name '*.key' -o -name '*.pem' | grep -v '.git' | head -1 | grep -q . && violations=$((violations + 1))
+      [ $violations -gt 0 ] && echo "ERROR: secrets detected" && exit 1
+      echo "No secrets detected."
