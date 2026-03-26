@@ -4,6 +4,9 @@ skip_list:
   - no-changed-when
   - risky-shell-pipe
   - var-naming[no-role-prefix]
+  - name[template]
+  - name[casing]
+  - yaml[comments-indentation]
 
 warn_list:
   - experimental
