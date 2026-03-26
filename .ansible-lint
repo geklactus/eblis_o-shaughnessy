@@ -1,0 +1,14 @@
+---
+skip_list:
+  - command-instead-of-module
+  - no-changed-when
+  - risky-shell-pipe
+
+warn_list:
+  - experimental
+
+offline: false
+
+exclude_paths:
+  - .github/
+  - .git/

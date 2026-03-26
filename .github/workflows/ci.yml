@@ -1,0 +1,181 @@
+---
+name: Ansible CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  ANSIBLE_FORCE_COLOR: "1"
+  PY_COLORS: "1"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install yamllint ansible-lint ansible-core
+
+      - name: Run yamllint
+        run: yamllint -c .yamllint.yml .
+
+      - name: Run ansible-lint
+        run: ansible-lint site.yml
+
+  syntax:
+    name: Syntax Check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Ansible and collections
+        run: |
+          pip install ansible-core
+          ansible-galaxy install -r requirements.yml
+
+      - name: Verify ansible.cfg is valid
+        run: ansible-config dump --only-changed
+
+      - name: Run syntax check
+        run: ansible-playbook site.yml --syntax-check
+
+  dry-run:
+    name: Dry-Run (Check Mode)
+    runs-on: ubuntu-latest
+    needs: syntax
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Ansible and collections
+        run: |
+          pip install ansible-core
+          ansible-galaxy install -r requirements.yml
+
+      - name: Create test certificate files
+        run: |
+          mkdir -p /tmp/test-certs
+          openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout /tmp/test-certs/ca.key \
+            -out /tmp/test-certs/ca.crt \
+            -days 1 -subj "/CN=Test InCommon CA" \
+            -addext "basicConstraints=critical,CA:TRUE"
+          openssl req -nodes -newkey rsa:2048 \
+            -keyout /tmp/test-certs/server.key \
+            -out /tmp/test-certs/server.csr \
+            -subj "/CN=gitlab.example.com"
+          openssl x509 -req \
+            -in /tmp/test-certs/server.csr \
+            -CA /tmp/test-certs/ca.crt \
+            -CAkey /tmp/test-certs/ca.key \
+            -CAcreateserial \
+            -out /tmp/test-certs/server.crt \
+            -days 1
+          rm -f /tmp/test-certs/server.csr /tmp/test-certs/ca.key
+
+      - name: Create test inventory and variables
+        run: |
+          cat > inventory/ci-hosts.yml << 'EOF'
+          ---
+          all:
+            children:
+              gitlab_runners:
+                hosts:
+                  localhost:
+                    ansible_connection: local
+                    ansible_python_interpreter: /usr/bin/python3
+          EOF
+          cat > group_vars/ci.yml << 'EOF'
+          ---
+          gitlab_url: "https://gitlab.example.com"
+          gitlab_runner_token: "glrt-ci-test-token-not-real"
+          gitlab_runner_name: "ci-test-runner"
+          network_interface: "eth0"
+          network_ip_address: "10.0.0.100"
+          network_prefix: 24
+          network_gateway: "10.0.0.1"
+          network_dns_servers: ["8.8.8.8"]
+          network_dns_search: ["example.com"]
+          cert_source_dir: "/tmp/test-certs"
+          EOF
+
+      - name: Run playbook in check mode (dry-run)
+        run: |
+          ansible-playbook site.yml \
+            -i inventory/ci-hosts.yml \
+            -e @group_vars/ci.yml \
+            --check --diff -vv
+        continue-on-error: true
+
+  validate-structure:
+    name: Validate Project Structure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify required files exist
+        run: |
+          echo "Checking project structure..."
+          required_files=(
+            "site.yml" "ansible.cfg" "requirements.yml"
+            "inventory/hosts.yml" "group_vars/all.yml"
+            "roles/network/tasks/main.yml"
+            "roles/network/handlers/main.yml"
+            "roles/certificates/tasks/main.yml"
+            "roles/certificates/handlers/main.yml"
+            "roles/selinux/tasks/main.yml"
+            "roles/selinux/templates/gitlab_runner.te.j2"
+            "roles/firewall/tasks/main.yml"
+            "roles/gitlab_runner/tasks/main.yml"
+            "roles/gitlab_runner/handlers/main.yml"
+            "roles/gitlab_runner/templates/config.toml.j2"
+            "roles/logrotate/tasks/main.yml"
+            "roles/logrotate/templates/gitlab-runner.logrotate.j2"
+          )
+          missing=0
+          for f in "${required_files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "  MISSING: $f"; missing=$((missing + 1))
+            else
+              echo "  OK: $f"
+            fi
+          done
+          [ $missing -gt 0 ] && echo "ERROR: $missing file(s) missing" && exit 1
+          echo "All required files present."
+
+      - name: Verify no sensitive values committed
+        run: |
+          echo "Checking for leaked secrets..."
+          violations=0
+          grep -rn 'glrt-[a-zA-Z0-9]\{20,\}' group_vars/all.yml 2>/dev/null && violations=$((violations + 1))
+          find . -name '*.key' -o -name '*.pem' | grep -v '.github' | head -1 | grep -q . && violations=$((violations + 1))
+          [ $violations -gt 0 ] && echo "ERROR: $violations secret(s) detected" && exit 1
+          echo "No secrets detected."
