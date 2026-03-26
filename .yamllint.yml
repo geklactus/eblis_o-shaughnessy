@@ -10,6 +10,8 @@ rules:
     check-keys: false
   comments:
     min-spaces-from-content: 1
+  commas:
+    max-spaces-after: -1
   braces:
     max-spaces-inside: 1
   brackets:
